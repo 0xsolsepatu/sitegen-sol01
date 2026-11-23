@@ -67,16 +67,27 @@ function isWs(c) {
 }
 
 /** The words of a body: its runs of characters other than whitespace (manual scan;
- *  astral code units are never whitespace, so charCodeAt is exact). */
+ *  astral code units are never whitespace, so charCodeAt is exact). ASCII whitespace
+ *  is only space and 9-13, so the common case never calls isWs. */
 function wordsOf(text) {
   let n = 0;
   let i = 0;
   const len = text.length;
   while (i < len) {
-    while (i < len && isWs(text.charCodeAt(i))) i++;
+    while (i < len) {
+      const c = text.charCodeAt(i);
+      if (c === 32 || (c >= 9 && c <= 13)) { i++; continue; }
+      if (c < 128 || !isWs(c)) break;
+      i++;
+    }
     if (i >= len) break;
     n++;
-    while (i < len && !isWs(text.charCodeAt(i))) i++;
+    while (i < len) {
+      const c = text.charCodeAt(i);
+      if (c === 32 || (c >= 9 && c <= 13)) break;
+      if (c >= 128 && isWs(c)) break;
+      i++;
+    }
   }
   return n;
 }
@@ -219,8 +230,9 @@ const BULLET_RE = /^[-*] (.*)$/;
 const ORDERED_RE = /^(\d{1,9})\. (.*)$/;
 const CONTINUED_RE = /^ {2,}\S/;
 
-/** The characters a backslash escapes. */
-const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
+/** The characters a backslash escapes, as a code-unit table (faster than Set.has). */
+const ESCAPABLE_CODE = new Uint8Array(128);
+for (const ch of ['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']) ESCAPABLE_CODE[ch.charCodeAt(0)] = 1;
 
 /** A heading line's level and text, or null (a heading's text is never empty). */
 function headingOf(line) {
@@ -247,7 +259,7 @@ function trimLine(line) {
 function findUnescaped(s, what, from, end) {
   const last = end - what.length;
   for (let j = from; j <= last; j++) {
-    if (s[j] === '\\' && j + 1 < end && ESCAPABLE.has(s[j + 1])) {
+    if (s.charCodeAt(j) === 92 && j + 1 < end && ESCAPABLE_CODE[s.charCodeAt(j + 1)] === 1) {
       j++;
       continue;
     }
@@ -259,13 +271,13 @@ function findUnescaped(s, what, from, end) {
 /** The first single * from `from` (one whose run is not **), outside an escape, or -1. */
 function findSingleStar(s, from, end) {
   for (let j = from; j < end; j++) {
-    const c = s[j];
-    if (c === '\\' && j + 1 < end && ESCAPABLE.has(s[j + 1])) {
+    const c = s.charCodeAt(j);
+    if (c === 92 && j + 1 < end && ESCAPABLE_CODE[s.charCodeAt(j + 1)] === 1) {
       j++;
       continue;
     }
-    if (c !== '*') continue;
-    if (j + 1 < end && s[j + 1] === '*') {
+    if (c !== 42) continue;
+    if (j + 1 < end && s.charCodeAt(j + 1) === 42) {
       j++;
       continue;
     }
@@ -281,8 +293,8 @@ function inlineRange(s, a, b, env) {
   let run = a;
   let i = a;
   while (i < b) {
-    const c = s[i];
-    if (c === '\\' && i + 1 < b && ESCAPABLE.has(s[i + 1])) {
+    const c = s.charCodeAt(i);
+    if (c === 92 && i + 1 < b && ESCAPABLE_CODE[s.charCodeAt(i + 1)] === 1) {
       if (i > run) out += escapeRange(s, run, i);
       const n = s[i + 1];
       out += n === '>' ? '&gt;' : n;
@@ -290,7 +302,7 @@ function inlineRange(s, a, b, env) {
       run = i;
       continue;
     }
-    if (c === '`') {
+    if (c === 96) {
       const j = s.indexOf('`', i + 1);
       if (j !== -1 && j < b && j > i + 1) {
         if (i > run) out += escapeRange(s, run, i);
@@ -304,8 +316,8 @@ function inlineRange(s, a, b, env) {
       }
       continue;
     }
-    if (c === '*') {
-      if (i + 1 < b && s[i + 1] === '*') {
+    if (c === 42) {
+      if (i + 1 < b && s.charCodeAt(i + 1) === 42) {
         const j = findUnescaped(s, '**', i + 2, b);
         if (j > i + 2) {
           if (i > run) out += escapeRange(s, run, i);
@@ -332,7 +344,7 @@ function inlineRange(s, a, b, env) {
       }
       continue;
     }
-    if (c === '[') {
+    if (c === 91) {
       const k = findUnescaped(s, ']', i + 1, b);
       const m = (k !== -1 && k + 1 < b && s[k + 1] === '(') ? s.indexOf(')', k + 2) : -1;
       const mm = (m !== -1 && m < b) ? m : -1;
@@ -615,9 +627,17 @@ function renderNodes(nodes, scope, ctx, depth) {
       case 4: {
         const xs = lookup(scope, n.p);
         if (!Array.isArray(xs)) break;
+        // One scope reused across iterations: rendering is synchronous and a
+        // re-entered for (via include) gets its own objects per invocation.
+        const vars = { [n.name]: undefined, loop: { index: 0, first: false, last: false, length: xs.length } };
+        const child = { vars, parent: scope };
+        const loop = vars.loop;
         for (let k = 0; k < xs.length; k++) {
-          const vars = { [n.name]: xs[k], loop: { index: k + 1, first: k === 0, last: k === xs.length - 1, length: xs.length } };
-          out += renderNodes(n.body, { vars, parent: scope }, ctx, depth);
+          vars[n.name] = xs[k];
+          loop.index = k + 1;
+          loop.first = k === 0;
+          loop.last = k === xs.length - 1;
+          out += renderNodes(n.body, child, ctx, depth);
         }
         break;
       }
@@ -650,7 +670,7 @@ function resolvePath(dir, rel) {
 function readSources(b) {
   const files = [...b.input.files].sort((x, y) => byCodeUnits(x.path, y.path));
   for (const f of files) {
-    if (f.path.endsWith('.md')) b.sources.push({ path: f.path, text: f.content.replace(/\r\n?/g, '\n') });
+    if (f.path.endsWith('.md')) b.sources.push({ path: f.path, text: f.content.includes('\r') ? f.content.replace(/\r\n?/g, '\n') : f.content });
     else b.statics.push({ path: f.path, content: f.content });
   }
 }
